@@ -93,6 +93,21 @@ const OPENCLAW_TOOL_MAPPING_PROMPT = [
 /** Models that have dedicated warm pools. */
 export const POOLED_MODELS = new Set<string>(["opus", "sonnet"]);
 
+// Crash-loop protection: a warm process that dies before serving a single
+// request within this window counts as a rapid death. After MAX_RAPID_DEATHS
+// consecutive rapid deaths the model's pool is degraded (no respawn) with
+// exponential backoff, and requests fall back to ClaudeSubprocess — which
+// surfaces the underlying CLI error (e.g. expired auth) instead of looping.
+const RAPID_DEATH_MS = 10_000;
+const MAX_RAPID_DEATHS = 3;
+const BACKOFF_BASE_MS = 60_000;
+const BACKOFF_MAX_MS = 15 * 60_000;
+
+interface SpawnHealth {
+  rapidDeaths: number;
+  degradedUntil: number;
+}
+
 export type PooledModel = "opus" | "sonnet";
 
 export interface PooledProcess {
@@ -184,6 +199,10 @@ export class SessionPoolRouter {
   private requestTimeouts = 0;
   private routeHits = { locked: 0, warm: 0, cold: 0, fallback: 0 };
 
+  // Crash-loop protection state
+  private spawnHealth = new Map<PooledModel, SpawnHealth>();
+  private recoveryTimers = new Map<PooledModel, NodeJS.Timeout>();
+
   constructor(config: Partial<PoolRouterConfig> = {}) {
     this.config = {
       opusSize: config.opusSize ?? 6,
@@ -196,6 +215,62 @@ export class SessionPoolRouter {
     };
     this.warmPool.set("opus", []);
     this.warmPool.set("sonnet", []);
+  }
+
+  // -------------------------------------------------------------------------
+  // Crash-loop protection
+  // -------------------------------------------------------------------------
+
+  private getSpawnHealth(model: PooledModel): SpawnHealth {
+    let health = this.spawnHealth.get(model);
+    if (!health) {
+      health = { rapidDeaths: 0, degradedUntil: 0 };
+      this.spawnHealth.set(model, health);
+    }
+    return health;
+  }
+
+  private isDegraded(model: PooledModel): boolean {
+    const health = this.spawnHealth.get(model);
+    return !!health && Date.now() < health.degradedUntil;
+  }
+
+  private scheduleRecovery(model: PooledModel): void {
+    if (this.recoveryTimers.has(model)) return;
+    const health = this.getSpawnHealth(model);
+    const delay = Math.max(health.degradedUntil - Date.now(), 0) + 1_000;
+    const timer = setTimeout(() => {
+      this.recoveryTimers.delete(model);
+      if (this.shuttingDown || Date.now() < health.degradedUntil) return;
+      if (this.allProcesses.size < this.config.maxTotalProcesses) {
+        console.log(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            event: "pool_recovery_attempt",
+            model,
+          })
+        );
+        this.spawnWarm(model).catch((err) => {
+          console.error(`[Router] Recovery spawn failed:`, err);
+        });
+      }
+    }, delay);
+    timer.unref?.();
+    this.recoveryTimers.set(model, timer);
+  }
+
+  private noteRapidDeathIfNeeded(pooled: PooledProcess): boolean {
+    const livedMs = Date.now() - pooled.spawnedAt;
+    const health = this.getSpawnHealth(pooled.model);
+    // Died young without ever serving a request → likely the CLI can't
+    // start at all (expired auth, bad flags, missing config). Lived long
+    // or served traffic → healthy death, reset the streak.
+    if (livedMs < RAPID_DEATH_MS && pooled.requestCount === 0) {
+      health.rapidDeaths++;
+    } else {
+      health.rapidDeaths = 0;
+    }
+    return health.rapidDeaths >= MAX_RAPID_DEATHS;
   }
 
   // -------------------------------------------------------------------------
@@ -254,6 +329,23 @@ export class SessionPoolRouter {
     }
 
     const pooledModel = model as PooledModel;
+
+    // Crash-loop protection: if warm processes for this model keep dying on
+    // startup, don't route here — the fallback ClaudeSubprocess surfaces the
+    // real CLI error (auth guidance etc.) instead of burning through spawns.
+    if (this.isDegraded(pooledModel)) {
+      console.log(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          event: "fallback_degraded_pool",
+          model,
+          sessionKey,
+          totalProcesses: this.allProcesses.size,
+        })
+      );
+      this.routeHits.fallback++;
+      return null; // caller uses ClaudeSubprocess
+    }
 
     // --- Lineage-based orphan reclamation ---
     const agentChannel = this.extractAgentChannel(sessionKey);
@@ -673,7 +765,11 @@ export class SessionPoolRouter {
       }
     }
 
-    // Normal release
+    // Normal release — the process served a request, so the CLI starts
+    // fine; reset the crash-loop streak for this model
+    const health = this.spawnHealth.get(pooled.model);
+    if (health && health.rapidDeaths > 0) health.rapidDeaths = 0;
+
     if (pooled.requestQueue.length > 0) {
       this.drainNextRequest(pooled);
     } else {
@@ -1003,11 +1099,44 @@ export class SessionPoolRouter {
       if (idx >= 0) warm.splice(idx, 1);
     }
 
-    if (!this.shuttingDown) {
-      this.spawnWarm(pooled.model).catch((err) => {
-        console.error(`[Router] Failed to respawn after death:`, err);
-      });
+    if (this.shuttingDown) return;
+
+    if (this.noteRapidDeathIfNeeded(pooled)) {
+      const health = this.getSpawnHealth(pooled.model);
+      if (Date.now() >= health.degradedUntil) {
+        // Streak just reached the threshold — enter (or re-enter) backoff
+        const backoffMs = Math.min(
+          BACKOFF_BASE_MS * 2 ** (health.rapidDeaths - MAX_RAPID_DEATHS),
+          BACKOFF_MAX_MS
+        );
+        health.degradedUntil = Date.now() + backoffMs;
+        console.log(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            event: "pool_degraded",
+            model: pooled.model,
+            rapidDeaths: health.rapidDeaths,
+            backoffMs,
+            note: "warm processes die immediately on startup - requests fall back to ClaudeSubprocess until CLI can start (check auth/credentials)",
+          })
+        );
+      } else {
+        console.log(
+          JSON.stringify({
+            ts: new Date().toISOString(),
+            event: "respawn_suppressed",
+            model: pooled.model,
+            rapidDeaths: health.rapidDeaths,
+          })
+        );
+      }
+      this.scheduleRecovery(pooled.model);
+      return;
     }
+
+    this.spawnWarm(pooled.model).catch((err) => {
+      console.error(`[Router] Failed to respawn after death:`, err);
+    });
   }
 
   private killAndRespawn(pooled: PooledProcess): void {
@@ -1034,7 +1163,8 @@ export class SessionPoolRouter {
 
     if (
       !this.shuttingDown &&
-      this.allProcesses.size < this.config.maxTotalProcesses
+      this.allProcesses.size < this.config.maxTotalProcesses &&
+      !this.isDegraded(pooled.model)
     ) {
       this.spawnWarm(pooled.model).catch((err) => {
         console.error(`[Router] Failed to respawn:`, err);
