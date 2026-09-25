@@ -27,6 +27,7 @@ import {
   isThinkingDelta,
 } from "../types/claude-cli.js";
 import type { ClaudeModel, CliImage, ClaudeEffort } from "../adapter/openai-to-cli.js";
+import { cliSpawnEnv } from "./spawn-env.js";
 import os from "os";
 
 export interface SubprocessOptions {

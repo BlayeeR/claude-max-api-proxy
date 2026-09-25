@@ -42,6 +42,7 @@ import {
   isSystemInit,
 } from "../types/claude-cli.js";
 import type { ClaudeModel } from "../adapter/openai-to-cli.js";
+import { cliSpawnEnv } from "./spawn-env.js";
 
 // ---------------------------------------------------------------------------
 // Tool mapping prompt (shared with manager.ts / pool.ts)
@@ -522,9 +523,7 @@ export class SessionPoolRouter {
 
     const child = spawn(process.env.CLAUDE_BIN || "claude", args, {
       cwd: process.env.HOME || "/tmp",
-      env: Object.fromEntries(
-        Object.entries(process.env).filter(([k]) => k !== "CLAUDECODE")
-      ),
+      env: cliSpawnEnv(),
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -1168,9 +1167,7 @@ export class SessionPoolRouter {
       this.pooledSpawnArgs(model),
       {
         cwd: process.env.HOME || "/tmp",
-        env: Object.fromEntries(
-          Object.entries(process.env).filter(([k]) => k !== "CLAUDECODE")
-        ),
+        env: cliSpawnEnv(),
         stdio: ["pipe", "pipe", "pipe"],
       }
     );
