@@ -13,6 +13,8 @@ import {
   ClaudeSubprocess,
   stageImages,
   cleanupImages,
+  isAuthError,
+  isAuthFailureText,
 } from "../subprocess/manager.js";
 import {
   SessionPoolRouter,
@@ -71,7 +73,7 @@ const AUTH_EXPIRED_MESSAGE = [
   "3. Den angezeigten Code per `POST /admin/relogin/complete` zurueckschicken.",
   "4. Danach funktioniert dieser Chat sofort wieder – die neuen Tokens liegen persistent im Volume.",
   "",
-  "Details: siehe DOCKER.md, Abschnitt 'Re-Login ohne Container-Zugriff'.",
+  "Details: admin endpoints /admin/relogin/start and /admin/relogin/complete.",
 ].join("\n");
 
 /**
@@ -237,13 +239,25 @@ export async function handleChatCompletions(
 
     if (poolKey && poolRouter) {
       const pooledInput = openaiToCli(body);
-      const result = poolRouter.execute(
-        pooledInput.prompt,
-        pooledInput.latestPrompt,
-        pooledInput.model,
-        poolKey,
-        body.messages.length
-      );
+
+      // Feature requests bypass the pool: client tools need --tools "" (a
+      // per-request CLI flag warm pooled processes can't take), effort needs
+      // --effort, and images need temp-file staging — the fallback
+      // ClaudeSubprocess path handles all three.
+      const needsPerRequestFlags =
+        (pooledInput.tools && pooledInput.tools.length > 0) ||
+        (pooledInput.images && pooledInput.images.length > 0) ||
+        !!pooledInput.effort;
+
+      const result = needsPerRequestFlags
+        ? null
+        : poolRouter.execute(
+            pooledInput.prompt,
+            pooledInput.latestPrompt,
+            pooledInput.model,
+            poolKey,
+            body.messages.length
+          );
 
       if (result) {
         // Pooled route
@@ -387,9 +401,18 @@ async function handlePooledStreaming(
       }
     };
 
+    let authFailed = false;
+
     const onContentDelta = (event: ClaudeCliStreamEvent) => {
       const delta = event.event.delta;
       const text = (delta?.type === "text_delta" && delta.text) || "";
+      // The CLI prints auth failures as plain result text - swallow them
+      // here and emit the guidance once at result/close instead
+      if (authFailed) return;
+      if (text && isAuthFailureText(text)) {
+        authFailed = true;
+        return;
+      }
       if (text && !res.writableEnded) {
         const chunk = {
           id: `chatcmpl-${requestId}`,
@@ -437,6 +460,27 @@ async function handlePooledStreaming(
       );
 
       if (!res.writableEnded) {
+        // Auth failure arrived as plain result text - emit the actionable
+        // guidance message instead of the raw CLI error
+        if (authFailed || isAuthFailureText(result.result || "")) {
+          const guidance = authExpiredResponse(requestId, lastModel);
+          const chunk = {
+            id: guidance.id,
+            object: "chat.completion.chunk",
+            created: guidance.created,
+            model: guidance.model,
+            choices: [
+              { index: 0, delta: { role: "assistant", content: AUTH_EXPIRED_MESSAGE }, finish_reason: null },
+              { index: 0, delta: {}, finish_reason: "stop" },
+            ],
+          };
+          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          res.write("data: [DONE]\n\n");
+          res.end();
+          resolve();
+          return;
+        }
+
         const doneChunk = createDoneChunk(requestId, lastModel);
         if (result.usage) {
           doneChunk.usage = {
@@ -445,6 +489,13 @@ async function handlePooledStreaming(
             total_tokens:
               (result.usage.input_tokens || 0) +
               (result.usage.output_tokens || 0),
+            // Prompt caching is automatic in Claude Code - surface the metrics
+            ...(result.usage.cache_read_input_tokens
+              ? { cache_read_input_tokens: result.usage.cache_read_input_tokens }
+              : {}),
+            ...(result.usage.cache_creation_input_tokens
+              ? { cache_creation_input_tokens: result.usage.cache_creation_input_tokens }
+              : {}),
           };
         }
         res.write(`data: ${JSON.stringify(doneChunk)}\n\n`);
@@ -478,6 +529,30 @@ async function handlePooledStreaming(
           error: error.message,
         })
       );
+
+      // Auth failure (expired OAuth, logged out) - emit the actionable
+      // guidance message instead of a raw error
+      if (isAuthError(error.message, null)) {
+        console.error("[Auth] Claude CLI authentication expired - user notified in chat");
+        if (!res.writableEnded) {
+          res.write(
+            `data: ${JSON.stringify({
+              id: `chatcmpl-${requestId}`,
+              object: "chat.completion.chunk",
+              created: Math.floor(Date.now() / 1000),
+              model: lastModel,
+              choices: [
+                { index: 0, delta: { role: "assistant", content: AUTH_EXPIRED_MESSAGE }, finish_reason: null },
+                { index: 0, delta: {}, finish_reason: "stop" },
+              ],
+            })}\n\n`
+          );
+          res.write("data: [DONE]\n\n");
+          res.end();
+        }
+        resolve();
+        return;
+      }
 
       if (!res.headersSent) {
         const status = errWithStatus.statusCode || 500;
@@ -568,6 +643,13 @@ async function handlePooledNonStreaming(
           requestCount: result.num_turns,
         })
       );
+      // Auth failure arrived as plain result text - emit the actionable
+      // guidance message instead of the raw CLI error
+      if (isAuthFailureText(result.result || "")) {
+        res.json(authExpiredResponse(requestId, model));
+        resolve();
+        return;
+      }
       res.json(cliResultToOpenai(result, requestId));
       resolve();
     });
@@ -591,6 +673,13 @@ async function handlePooledNonStreaming(
           error: error.message,
         })
       );
+
+      if (isAuthError(error.message, null)) {
+        console.error("[Auth] Claude CLI authentication expired - user notified in chat");
+        res.json(authExpiredResponse(requestId, model));
+        resolve();
+        return;
+      }
 
       if (!res.headersSent) {
         const status = errWithStatus.statusCode || 500;

@@ -89,6 +89,24 @@ export function isAuthError(stderr: string, exitCode: number | null): boolean {
 }
 
 /**
+ * True if a CLI response's text body is an authentication failure.
+ * The CLI sometimes prints these as normal result text instead of stderr
+ * (e.g. "Failed to authenticate: OAuth session expired and could not be
+ * refreshed"). Bounded length keeps false positives near zero.
+ */
+export function isAuthFailureText(text: string): boolean {
+  const t = text.trim().toLowerCase();
+  if (!t || t.length > 300) return false;
+  return (
+    t.startsWith("failed to authenticate") ||
+    t.startsWith("authentication error") ||
+    t.startsWith("api error: authentication") ||
+    t.includes("please run claude auth login") ||
+    t.includes("please run /login")
+  );
+}
+
+/**
  * Stage request images as temp files so the CLI can read them via the Read tool.
  * Returns absolute file paths. Caller is responsible for cleanup.
  * Remote URLs are downloaded (5s timeout, bounded size).
