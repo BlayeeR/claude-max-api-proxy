@@ -13,6 +13,7 @@ import {
   createDoneChunk,
 } from "../adapter/cli-to-openai.js";
 import { getSession, setSession, clearSession } from "../subprocess/session-store.js";
+import { getModelCatalog } from "../models/catalog.js";
 import type { OpenAIChatRequest, OpenAIToolCall } from "../types/openai.js";
 import type { ClaudeCliAssistant, ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
 
@@ -447,21 +448,13 @@ async function handleNonStreamingResponse(
 /**
  * Handle GET /v1/models
  *
- * Returns available models
+ * Returns the model list discovered from the CLI's bundled catalog
+ * (aliases + full model IDs) — see src/models/catalog.ts
  */
-export function handleModels(_req: Request, res: Response): void {
+export async function handleModels(_req: Request, res: Response): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
-  const modelIds = [
-    "claude-opus-4",
-    "claude-opus-4-6",
-    "claude-sonnet-4",
-    "claude-sonnet-4-5",
-    "claude-sonnet-4-6",
-    "claude-sonnet-5",
-    "claude-opus-5",
-    "claude-haiku-4",
-    "claude-haiku-4-5",
-  ];
+  const { aliases, models } = await getModelCatalog();
+  const modelIds = [...aliases, ...models.map((m) => m.id)];
   res.json({
     object: "list",
     data: modelIds.map((id) => ({

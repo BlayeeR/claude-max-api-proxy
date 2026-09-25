@@ -106,7 +106,7 @@ const OPENCLAW_TOOL_MAPPING_PROMPT = [
  */
 let resolvedClaudeBin: { bin: string; shell: boolean } | null = null;
 
-function resolveClaudeBin(): { bin: string; shell: boolean } {
+export function resolveClaudeBin(): { bin: string; shell: boolean } {
   if (process.env.CLAUDE_BIN) {
     // Environment overrides are intentionally not cached. This lets callers
     // temporarily select a binary without contaminating later resolutions.

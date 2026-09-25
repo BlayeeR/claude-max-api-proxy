@@ -4,7 +4,12 @@
 
 import type { OpenAIChatRequest, OpenAIContentBlock } from "../types/openai.js";
 
-export type ClaudeModel = "opus" | "sonnet" | "haiku";
+/**
+ * Model string passed to `claude --model`. The CLI accepts family aliases
+ * ("opus", "sonnet", "haiku", "fable", ...) and full model IDs
+ * ("claude-fable-5", ...) — anything else it rejects itself.
+ */
+export type ClaudeModel = string;
 
 export interface CliInput {
   prompt: string;
@@ -12,42 +17,44 @@ export interface CliInput {
   sessionId?: string;
 }
 
-const MODEL_MAP: Record<string, ClaudeModel> = {
-  // Direct model names (provider prefixes like `claude-code-cli/` and `claude-max/`
-  // are stripped by extractModel before consulting this map)
-  "claude-opus-4": "opus",
-  "claude-opus-4-6": "opus",
-  "claude-sonnet-4": "sonnet",
-  "claude-sonnet-4-5": "sonnet",
-  "claude-sonnet-4-6": "sonnet",
-  "claude-sonnet-5": "sonnet",
-  "claude-opus-5": "opus",
-  "claude-haiku-4": "haiku",
-  "claude-haiku-4-5": "haiku",
-  // Bare aliases
-  "opus": "opus",
-  "sonnet": "sonnet",
-  "haiku": "haiku",
-  "opus-max": "opus",
-  "sonnet-max": "sonnet",
-};
+/** Model families the CLI resolves to their latest release */
+const FAMILIES = ["opus", "sonnet", "haiku", "fable"];
+
+// Matches short-form family names like "claude-sonnet-4" or
+// "claude-opus-4-6" (but not exact ids like "claude-3-5-haiku")
+const SHORT_FAMILY_RE = new RegExp(
+  `^claude-(${FAMILIES.join("|")})(?:-\\d[\\w-]*)?$`
+);
 
 /**
- * Extract Claude model alias from request model string
+ * Extract the model string to pass to `claude --model`.
+ *
+ * No hardcoded version list: full model IDs pass through for the CLI to
+ * resolve or reject, and short-form family names resolve to the family
+ * alias so they always track the latest release.
  */
 export function extractModel(model: string): ClaudeModel {
-  // Try direct lookup
-  if (MODEL_MAP[model]) {
-    return MODEL_MAP[model];
-  }
-
-  // Try stripping provider prefix
+  // Strip provider prefixes like `claude-code-cli/` and `claude-max/`
   const stripped = model.replace(/^(?:claude-code-cli|claude-max)\//, "");
-  if (MODEL_MAP[stripped]) {
-    return MODEL_MAP[stripped];
+
+  if (FAMILIES.includes(stripped) || stripped === "best") {
+    return stripped;
   }
 
-  // Default to opus (Claude Max subscription)
+  // "claude-sonnet-4", "claude-opus-4-6" → family alias (latest)
+  const shortFamily = stripped.match(SHORT_FAMILY_RE);
+  if (shortFamily) {
+    return shortFamily[1];
+  }
+
+  // Full model IDs ("claude-fable-5-1", "claude-3-5-haiku", ...) pass
+  // through — the CLI resolves them, so new releases work without
+  // proxy changes. Unknown IDs fail in the CLI, which is correct.
+  if (/^claude-[a-z0-9-]+$/.test(stripped)) {
+    return stripped;
+  }
+
+  // Default for unrecognizable input (Claude Max subscription)
   return "opus";
 }
 

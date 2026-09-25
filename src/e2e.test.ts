@@ -47,7 +47,7 @@ describe("health and models", () => {
     assert.ok(body.timestamp);
   });
 
-  it("GET /v1/models lists all model IDs", async () => {
+  it("GET /v1/models lists aliases and catalog model IDs", async () => {
     const res = await fetch(`${baseUrl}/v1/models`);
     assert.equal(res.status, 200);
     const body = await res.json() as any;
@@ -55,17 +55,13 @@ describe("health and models", () => {
     assert.ok(Array.isArray(body.data));
 
     const ids = body.data.map((m: any) => m.id);
-    for (const expected of [
-      "claude-opus-4",
-      "claude-opus-4-6",
-      "claude-sonnet-4",
-      "claude-sonnet-4-5",
-      "claude-sonnet-4-6",
-      "claude-haiku-4",
-      "claude-haiku-4-5",
-    ]) {
-      assert.ok(ids.includes(expected), `missing model ${expected}`);
+    // Evergreen family aliases must always be listed
+    for (const expected of ["sonnet", "opus", "haiku", "fable"]) {
+      assert.ok(ids.includes(expected), `missing alias ${expected}`);
     }
+    // Catalog scan must have discovered full model IDs from the CLI bundle
+    const fullIds = ids.filter((id: string) => /^claude-[a-z0-9-]+$/.test(id));
+    assert.ok(fullIds.length > 0, "no full model IDs from CLI catalog scan");
 
     for (const model of body.data) {
       assert.equal(model.object, "model");

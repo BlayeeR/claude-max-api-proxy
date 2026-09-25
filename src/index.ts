@@ -7,39 +7,60 @@
 
 import { startServer, stopServer, getServer } from "./server/index.js";
 import { verifyClaude, verifyAuth } from "./subprocess/manager.js";
+import { getModelCatalog } from "./models/catalog.js";
+import type { ModelCatalog } from "./models/catalog.js";
 
 // Provider constants
 const PROVIDER_ID = "claude-code-cli";
 const PROVIDER_LABEL = "Claude Code CLI";
 const DEFAULT_PORT = 3456;
-const DEFAULT_MODEL = "claude-code-cli/claude-sonnet-4";
+// Evergreen alias — the CLI resolves it to the latest model of the family
+const DEFAULT_MODEL = "claude-code-cli/sonnet";
 
-// Available models
-const AVAILABLE_MODELS = [
-  {
-    id: "claude-opus-4",
-    name: "Claude Opus 4.5",
-    alias: "opus",
-    reasoning: true,
-  },
-  {
-    id: "claude-sonnet-4",
-    name: "Claude Sonnet 4",
-    alias: "sonnet",
-    reasoning: false,
-  },
-  {
-    id: "claude-haiku-4",
-    name: "Claude Haiku 4",
-    alias: "haiku",
-    reasoning: false,
-  },
-];
+interface AvailableModel {
+  id: string;
+  name: string;
+  alias: string;
+  reasoning: boolean;
+}
+
+/** Reasoning flag per family; unknown families default to true */
+const FAMILY_REASONING: Record<string, boolean> = {
+  fable: true,
+  mythos: true,
+  opus: true,
+  sonnet: false,
+  haiku: false,
+};
+
+/**
+ * Build available models from the CLI's bundled catalog — no hardcoded
+ * model list. Falls back to the family aliases if the catalog scan failed.
+ */
+function buildAvailableModels(catalog: ModelCatalog): AvailableModel[] {
+  if (catalog.models.length > 0) {
+    return catalog.models.map((m) => ({
+      id: m.id,
+      name: m.displayName,
+      alias: m.family,
+      reasoning: FAMILY_REASONING[m.family] ?? true,
+    }));
+  }
+  // Fallback: family aliases with display names
+  return catalog.aliases
+    .filter((a) => FAMILY_REASONING[a] !== undefined)
+    .map((a) => ({
+      id: a,
+      name: `Claude ${a.charAt(0).toUpperCase()}${a.slice(1)}`,
+      alias: a,
+      reasoning: FAMILY_REASONING[a],
+    }));
+}
 
 /**
  * Build model definitions for Clawdbot config
  */
-function buildModelDefinition(model: (typeof AVAILABLE_MODELS)[number]) {
+function buildModelDefinition(model: AvailableModel) {
   return {
     id: model.id,
     name: model.name,
@@ -137,6 +158,9 @@ const claudeCodeCliPlugin = {
               await startServer({ port: serverPort });
               spin.stop("Claude CLI provider ready");
 
+              // 5. Discover models from the CLI's bundled catalog
+              const availableModels = buildAvailableModels(await getModelCatalog());
+
               const baseUrl = `http://127.0.0.1:${serverPort}/v1`;
 
               return {
@@ -158,14 +182,14 @@ const claudeCodeCliPlugin = {
                         apiKey: "local",
                         api: "openai-completions",
                         authHeader: false,
-                        models: AVAILABLE_MODELS.map(buildModelDefinition),
+                        models: availableModels.map(buildModelDefinition),
                       },
                     },
                   },
                   agents: {
                     defaults: {
                       models: Object.fromEntries(
-                        AVAILABLE_MODELS.map((m) => [
+                        availableModels.map((m) => [
                           `${PROVIDER_ID}/${m.id}`,
                           {},
                         ])
