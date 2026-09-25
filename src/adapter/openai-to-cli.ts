@@ -207,7 +207,6 @@ export function messagesToPrompt(
 }
 
 /**
-/**
  * Extract only the latest user message from the messages array.
  * Used by pooled processes on subsequent turns (requestCount > 0)
  * where the CLI already has system context and prior turns in memory.

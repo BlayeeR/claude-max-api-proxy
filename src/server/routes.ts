@@ -712,6 +712,38 @@ async function handleStreamingResponse(
           object: "chat.completion.chunk",
           created: Math.floor(Date.now() / 1000),
           model: lastModel,
+          choices: [{
+            index: 0,
+            delta: { reasoning: text },
+            finish_reason: null,
+          }],
+        };
+        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      }
+    });
+
+    // Handle streaming content deltas
+    subprocess.on("content_delta", (event: ClaudeCliStreamEvent) => {
+      const delta = event.event.delta;
+      let text = (delta?.type === "text_delta" && delta.text) || "";
+      if (expectsClientTools) {
+        // Buffer instead of streaming: the text may be a <tool_call> envelope
+        // that must be converted into tool_calls, never shown to the user
+        accumulatedText += text;
+        return;
+      }
+      // CLI surfaces auth failures as plain text on stdout in some failure
+      // modes - swallow them here; the error/close handlers emit the guidance
+      // message exactly once.
+      if (text && subprocess.hasAuthError()) {
+        return;
+      }
+      if (text && !res.writableEnded) {
+        const chunk = {
+          id: `chatcmpl-${requestId}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: lastModel,
           choices: [
             {
               index: 0,
