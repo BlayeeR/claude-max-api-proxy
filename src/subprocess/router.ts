@@ -127,6 +127,8 @@ export interface PooledProcess {
   ready: boolean;
   requestTimeoutTimer: NodeJS.Timeout | null;
   orphaned: boolean;
+  /** Last ~2KB of stderr - logged on death so startup failures are visible */
+  stderrTail: string;
 }
 
 export interface PendingRequest {
@@ -495,9 +497,9 @@ export class SessionPoolRouter {
     return proc;
   }
 
-  private spawnProcess(model: PooledModel): PooledProcess {
-    const id = this.nextId++;
-    const args = [
+  /** CLI args used for pooled processes (shared with the degrade diagnostic) */
+  private pooledSpawnArgs(model: PooledModel): string[] {
+    return [
       "--print",
       "--input-format",
       "stream-json",
@@ -512,6 +514,11 @@ export class SessionPoolRouter {
       "--append-system-prompt",
       OPENCLAW_TOOL_MAPPING_PROMPT,
     ];
+  }
+
+  private spawnProcess(model: PooledModel): PooledProcess {
+    const id = this.nextId++;
+    const args = this.pooledSpawnArgs(model);
 
     const child = spawn(process.env.CLAUDE_BIN || "claude", args, {
       cwd: process.env.HOME || "/tmp",
@@ -538,6 +545,7 @@ export class SessionPoolRouter {
       ready: false,
       requestTimeoutTimer: null,
       orphaned: false,
+      stderrTail: "",
     };
 
     this.allProcesses.set(id, pooled);
@@ -549,6 +557,8 @@ export class SessionPoolRouter {
 
     child.stderr?.on("data", (chunk: Buffer) => {
       const text = chunk.toString().trim();
+      // Keep a bounded tail so death logs show WHY the CLI exited
+      pooled.stderrTail = (pooled.stderrTail + "\n" + text).slice(-2048);
       if (process.env.DEBUG_SUBPROCESS) {
         console.error(`[Router:${id}] stderr:`, text.slice(0, 200));
       }
@@ -1072,6 +1082,9 @@ export class SessionPoolRouter {
         model: pooled.model,
         state: pooled.state,
         lockedTo: pooled.lockedTo,
+        ...(pooled.stderrTail
+          ? { stderr: pooled.stderrTail.slice(-500) }
+          : {}),
       })
     );
 
@@ -1120,6 +1133,9 @@ export class SessionPoolRouter {
             note: "warm processes die immediately on startup - requests fall back to ClaudeSubprocess until CLI can start (check auth/credentials)",
           })
         );
+        // One-shot diagnostic with the pooled spawn args - surfaces the
+        // real CLI error (unknown flag, auth failure, missing HOME, ...)
+        this.runSpawnDiagnostic(pooled.model);
       } else {
         console.log(
           JSON.stringify({
@@ -1136,6 +1152,59 @@ export class SessionPoolRouter {
 
     this.spawnWarm(pooled.model).catch((err) => {
       console.error(`[Router] Failed to respawn after death:`, err);
+    });
+  }
+
+  /**
+   * One-shot diagnostic: run the exact pooled spawn once, capture the CLI's
+   * stderr and exit code, log it. When warm processes die on startup this
+   * surfaces the real reason (unknown flag, auth error, missing HOME, ...)
+   * once per degrade instead of leaving the user to guess.
+   */
+  private runSpawnDiagnostic(model: PooledModel): void {
+    const startedAt = Date.now();
+    const child = spawn(
+      process.env.CLAUDE_BIN || "claude",
+      this.pooledSpawnArgs(model),
+      {
+        cwd: process.env.HOME || "/tmp",
+        env: Object.fromEntries(
+          Object.entries(process.env).filter(([k]) => k !== "CLAUDECODE")
+        ),
+        stdio: ["pipe", "pipe", "pipe"],
+      }
+    );
+
+    let stderr = "";
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr = (stderr + chunk.toString()).slice(-4096);
+    });
+
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Already dead
+      }
+    }, 10_000);
+    timer.unref?.();
+
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      const livedMs = Date.now() - startedAt;
+      console.log(
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          event: "pool_spawn_diagnostic",
+          model,
+          code,
+          livedMs,
+          ...(stderr.trim() ? { stderr: stderr.trim().slice(-1000) } : {}),
+          ...(stderr.trim() === ""
+            ? { note: "CLI exited with no stderr - check HOME/CLAUDE_CONFIG_DIR and that the CLI starts with these args" }
+            : {}),
+        })
+      );
     });
   }
 
