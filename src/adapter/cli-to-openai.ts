@@ -101,6 +101,13 @@ export function cliResultToOpenai(
       completion_tokens: result.usage?.output_tokens || 0,
       total_tokens:
         (result.usage?.input_tokens || 0) + (result.usage?.output_tokens || 0),
+      // Prompt caching is automatic in Claude Code - surface the metrics
+      ...(result.usage?.cache_read_input_tokens
+        ? { cache_read_input_tokens: result.usage.cache_read_input_tokens }
+        : {}),
+      ...(result.usage?.cache_creation_input_tokens
+        ? { cache_creation_input_tokens: result.usage.cache_creation_input_tokens }
+        : {}),
     },
   };
 }
@@ -111,5 +118,11 @@ export function cliResultToOpenai(
  * instead of rewriting to a fixed list, so new models are reported correctly.
  */
 function normalizeModelName(model: string | undefined): string {
-  return model || "claude-sonnet-4";
+  if (!model) return "claude-sonnet-4";
+  // Keep the major version visible: "claude-opus-5-..." -> "claude-opus-5".
+  // Anything else (new families, exact ids without date suffix) passes
+  // through verbatim so new models are reported correctly.
+  const m = model.match(/claude-(opus|sonnet|haiku|fable|mythos)-(\d+)/);
+  if (m) return `claude-${m[1]}-${m[2]}`;
+  return model;
 }
